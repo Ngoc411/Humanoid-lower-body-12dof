@@ -1,0 +1,213 @@
+================================================================================
+ TÓM TẮT AN TOÀN / BẢO VỆ DATA — PHÍA STM32 (main board, SPI slave)
+ Dự án: Chaos_main_1  —  STM32F407VET6
+ Cập nhật: 2026-06
+================================================================================
+
+Vai trò STM32: cầu nối Jetson <-> 12 node motor.
+  - CAN: hỏi 12 node (SYNC) -> gom obs (pos/vel); nhận action -> forward node.
+  - SPI3 (slave, DMA): gửi obs (46 float) lên Jetson, nhận action (46 float) về.
+  - Jetson trigger vòng 50Hz LIÊN TỤC; STM là bên QUYẾT ĐỊNH có forward action không.
+  - ĐƠN VỊ tại STM/dây: ĐỘ (deg) + RPM. (rad/rad-s chỉ ở Jetson.)
+  - Hệ trục: gz = trục thẳng đứng. Đứng thẳng = gz ≈ -1.
+
+
+================================================================================
+ 1) THƯ VIỆN PROTECTION  (lib/Protection)
+================================================================================
+  Độc lập HAL, test được trên PC. Cung cấp:
+    - NaN/Inf:     Protection_IsFinite, ArrayAllFinite
+    - Range/clamp: Protection_Clamp, InRange, Sanitize
+    - CRC32:       Protection_CRC32 (tương thích zlib; "123456789"->0xCBF43926),
+                   AppendCRC32, CheckTrailingCRC32
+    - Framing:     CheckMagic/WriteMagic
+    - Sequence:    SeqCheck (FIRST/OK/GAP/DUP/OUT_OF_ORDER)
+    - Watchdog:    WatchdogInit/Feed/Expired (an toàn khi tick tràn 32-bit)
+    - Slew:        SlewInit/SlewStep/ApplyActionSlew
+    - Validator:   ValidateActions (NaN+clamp+hold), ValidateJoint (hiện không dùng)
+    - Giới hạn vị trí TỪNG khớp (deg) lấy từ Chaos_test3 SP_LIMIT:
+        j0[-50,50] j1[-50,50] j2[-15,10] j3[-10,15] j4[-10,10] j5[-10,10]
+        j6[-100,0] j7[-100,0] j8..j11[-45,45]
+      Vận tốc: |v| <= PROT_JOINT_VEL_ABS_MAX (RPM, tạm 30 — đo lại thực tế).
+
+
+================================================================================
+ 2) LỌC DATA QUA CAN / SPI
+================================================================================
+  A. ACTION (Jetson -> node) — trong ProcessSpiFrame, PHẢI chặn/kẹp:
+       - check frame type == CMD_ACTION  (spi_rx_buffer[0] == 2.0f)
+       - NaN/Inf  -> giữ lệnh hợp lệ trước đó (hold prev_actions), KHÔNG về 0
+       - clamp về dải vị trí TỪNG khớp (deg)
+       - slew 4c: ĐANG TẮT (PROT_ENABLE_ACTION_SLEW=0) — bật sau khi đo biên độ
+       - chỉ forward khi SafeLevel==RUN + đã "armed" (xem mục 6, 7)
+
+  B. OBS — phải TRUNG THỰC, KHÔNG clamp (kẹp obs = nói dối policy):
+       - feedback khớp (CAN RX): NaN -> giữ giá trị cũ; ngoài tầm -> GIỮ số thật,
+         chỉ ĐẾM (can_pos_bad/can_vel_bad).
+       - IMU/cmd (PublishObsToSpi, obs_finite): NaN -> 0 (đếm obs_nan); KHÔNG clamp.
+
+  C. CHƯA làm (cần ĐỒNG BỘ với Jetson): magic header/footer + sequence + CRC32
+     trên khung SPI. Hiện chỉ có "frame type" tối thiểu.
+
+
+================================================================================
+ 3) HANDSHAKE INIT (chờ đủ 12 node mới chạy)
+================================================================================
+  - TIM5 (5s) broadcast CAN_ID_CHECK_INIT_DONE (100) hỏi "init xong chưa".
+  - Node báo xong bằng CAN_ID_INIT_DONE = 101..112 (mỗi node 1 ID).
+  - STM gom bit vào init_done_mask; đủ 12 (0x0FFF) -> all_nodes_ready=1, STOP TIM5.
+  - Trước khi đủ: chu kỳ obs VẪN chạy (đọc IMU, gửi STATUS=WAIT) nhưng action bị
+    chặn bởi SafeLevel (HOLD khi !all_nodes_ready).
+  - Bền với mất gói / đua thứ tự boot (cứ 5s hỏi lại).
+
+
+================================================================================
+ 4) CHÍNH SÁCH THIẾU KHỚP (obs)  — mỗi vòng đếm số khớp thiếu
+================================================================================
+    thiếu 0..3 (<=OBS_MAX_MISSING)  : gửi obs (khớp thiếu xài số cũ).
+    thiếu 4+ lẻ tẻ                  : KHÔNG gửi obs vòng đó -> PD5 thấp -> motor tự giữ.
+    thiếu 4+ 4 vòng liền            : obs_locked=1 -> HOLD (bỏ lệnh, đứng yên).
+    đang khóa, đủ 5 vòng tốt liền   : mở khóa.
+    thiếu 4+ >=250 vòng liền (~5s)  : reset hoàn toàn về init (init_done_mask=0,
+                                       all_nodes_ready=0, obs_locked=0, bật lại TIM5).
+  Chính sách trên CHỈ áp dụng ở PHA SẴN SÀNG (all_nodes_ready=1 && !robot_falling).
+  Ở PHA CHƯA SẴN SÀNG: LUÔN gửi obs với STATUS=WAIT, không áp khóa/arming.
+  Không cắt FET ở bất kỳ nhánh nào.
+  Tham số: OBS_MAX_MISSING=3, OBS_SEVERE_ENTER=4, OBS_RECOVER_GOOD=5,
+           OBS_REINIT_CYCLES=250.
+
+
+================================================================================
+ 5) PHÁT HIỆN NGÃ (falling)  — từ projected gravity, sign-aware
+================================================================================
+  - KHỚP công thức Jetson: tilt = atan2(hypot(gx,gy), -gz) > 20°
+    Tương đương (sign-aware, dùng gz CÓ DẤU):
+        gz >= 0                          -> ngã chắc chắn (lật ngửa / lật úp)
+        gz <  0  VÀ  h² > gz² * 0.13247 -> ngã (h=hypot(gx,gy), 0.13247=tan²(20°))
+    LƯU Ý: đứng thẳng gz ≈ -1; gz>=0 là dấu hiệu lật — dùng gz² sẽ bỏ sót trường hợp này.
+
+  - Chống nhiễu: nghiêng FALL_ENTER_CYCLES(3) vòng liền -> robot_falling=1.
+                 thẳng lại FALL_EXIT_CYCLES(10) vòng liền -> robot_falling=0.
+
+  - Khi ngã (cạnh lên robot_falling 0->1):
+        * reset all_nodes_ready=0, init_done_mask=0, action_armed=0.
+        * broadcast CAN 150 theo CỤM (FALLING_BURST_CYCLES=10 vòng, KHÔNG liên tục)
+          -> node nhận -> tự NVIC_SystemReset -> chạy lại calibration+homing.
+          (gửi cụm thay vì liên tục để node KHÔNG reset lặp khi robot còn nằm.)
+        * bật lại TIM5 -> poll CHECK_INIT_DONE (homing xong chưa).
+
+  - Chu kỳ obs VẪN chạy (Jetson giữ trigger 50Hz) -> đọc IMU phát hiện đứng thẳng,
+    gửi obs cho Jetson với STATUS=WAIT.
+
+  - Hồi phục: robot_falling=0 (10 vòng thẳng) VÀ đủ 12 node init xong
+    -> STATUS=READY -> Jetson chạy lại -> STM arming 5s -> xả action.
+
+  - IMU NaN -> giữ nguyên trạng thái (không cập nhật streak, không kết luận).
+  - LƯU Ý: giả định gz là trục thẳng đứng — kiểm lúc đứng yên gz≈-1.
+
+
+================================================================================
+ 6) TRẠNG THÁI AN TOÀN THỐNG NHẤT  (Robot_SafeLevel)
+================================================================================
+  Lấy mức nguy hiểm NHẤT từ mọi nguồn (thứ tự ưu tiên):
+        robot_falling=1                        -> SAFE_PROTECT
+        !all_nodes_ready / obs_locked          -> SAFE_HOLD
+        can_busoff=1                           -> SAFE_HOLD
+        còn lại                                -> SAFE_RUN
+  (SAFE_SHUTDOWN để dành cho BMS — chưa làm.)
+
+  Bus-off: vào HOLD; tự xóa can_busoff khi nhận lại được frame CAN bất kỳ.
+
+  ProcessSpiFrame kiểm tra: SafeLevel != SAFE_RUN -> return (không forward).
+  Arming (mục 7) kiểm tra thêm: SafeLevel == SAFE_RUN mới tính thời gian ổn định.
+
+
+================================================================================
+ 7) CỔNG ỔN ĐỊNH 5s (arming)  — sau init / sau khi đứng dậy
+================================================================================
+  STM chỉ forward action khi: action_armed=1.
+  Arming đạt được khi TẤT CẢ điều kiện sau giữ LIÊN TỤC đủ STABILIZE_MS (5000ms):
+    - SafeLevel == SAFE_RUN
+    - thiếu khớp <= OBS_MAX_MISSING (obs đủ)
+    - action từ Jetson "tươi" (watchdog 60ms chưa expire)
+    - mọi khớp đổi < STABLE_DELTA_DEG (1°) so vòng trước (ít dao động)
+    - nrf_action=1 (NRF gate cho phép — bật/tắt qua remote)
+  Một trong các điều kiện fail -> đồng hồ reset về 0 (đếm lại từ đầu).
+  Một khi armed: giữ nguyên cho đến khi ngã / mất node / reset.
+
+  Tín hiệu cho Jetson: TX[45] STATUS = READY khi (all_nodes_ready=1 && !robot_falling),
+                        else WAIT.  Arming ở STM diễn ra SAU khi Jetson thấy READY.
+
+  Cổng cuối cùng:  forward action  <=>  SafeLevel==RUN  VÀ  action_armed==1
+
+  KHUNG SPI: 46 float (184 byte) — TX[45]=STATUS. JETSON PHẢI dùng 46 float.
+
+
+================================================================================
+ 8) WATCHDOG LINK ACTION (Lớp 5)
+================================================================================
+  - Feed mỗi khung action hợp lệ (CMD_ACTION, kể cả khi chưa armed). Quá
+    PROT_ACTION_TIMEOUT_MS(60ms) không có -> watchdog expire; arming reset.
+  - Mất link -> motor giữ lệnh cuối (không có khung mới -> không forward).
+
+  Ngoài ra: SPI_TIMEOUT_MS (1000ms) — nếu Jetson KHÔNG clock SPI hoàn toàn quá
+  1000ms, STM reset về trạng thái WAIT + trigger homing lại (kiểm tra trong main loop
+  qua spi_last_ms).
+
+
+================================================================================
+ 9) QUAN TRẮC (đọc trong debugger)  — prot_stats + biến trạng thái
+================================================================================
+  prot_stats: action_nan, action_clip, action_slew, can_pos_bad, can_vel_bad,
+              obs_nan, stale_events, (spi_crc/seq... khi làm CRC).
+  Trạng thái: Robot_SafeLevel(), action_armed, robot_falling, obs_locked,
+              obs_bad_streak/good_streak, obs_severe_count, last_severe_joints,
+              all_nodes_ready, init_done_mask, can_busoff,
+              collecting_timeout_count, last_timeout_joints,
+              dbg_action_full_sent, dbg_action_tx_timeout,
+              jetson_action_link_ok, dbg_action_timeout_ms.
+
+
+================================================================================
+ 10) CAN ID  /  TIMER
+================================================================================
+  CAN ID:
+     50       SYNC (STM->node)
+     51..62   action từng khớp (STM->node)  [CAN_ACTION_ID_BASE=0x33]
+     1..12    feedback pos/vel (node->STM)
+     100      CHECK_INIT_DONE (STM->node)
+     101..112 INIT_DONE (node->STM)
+     150      FALLING (STM->node)
+
+  TIMER (TIM2/3/4/5 trên APB1 = 84MHz):
+     TIM2  1kHz(1ms)  watchdog PD5 (trigger 10ms — force PD5 LOW nếu SPI T1 chậm)
+     TIM3  1kHz(1ms)  cycle timer: abort action@5ms, collecting timeout@10ms
+     TIM4  1kHz(1ms)  EXTI gate (15ms — chặn glitch / re-trigger)
+     TIM5  0.2Hz(5s)  poll CHECK_INIT_DONE (dừng khi đủ 12 node)
+
+
+================================================================================
+ 11) THAM SỐ CHỈNH ĐƯỢC  (lib/Utils/utils.h)
+================================================================================
+  COLLECTING_TIMEOUT_MS=10  | OBS_MAX_MISSING=3   | OBS_SEVERE_ENTER=4  |
+  OBS_RECOVER_GOOD=5        | OBS_REINIT_CYCLES=250|
+  FALL_GROUND_ANGLE_DEG=70  | FALL_TILT_TAN2=0.13247 (=tan²(20°); đổi góc->đổi số này) |
+  FALL_ENTER_CYCLES=3       | FALL_EXIT_CYCLES=10  | FALLING_BURST_CYCLES=10 |
+  STABILIZE_MS=5000         | STABLE_DELTA_DEG=1.0 |
+  PROT_ACTION_TIMEOUT_MS=60 | SPI_TIMEOUT_MS=1000  |
+  PROT_ENABLE_ACTION_SLEW=0 | PROT_ACTION_SLEW_MAX=5
+  (lib/Protection/protection.h: PROT_JOINT_POS_MIN/MAX[12], PROT_JOINT_VEL_ABS_MAX)
+
+
+================================================================================
+ 12) CHƯA LÀM / CÒN LẠI
+================================================================================
+  - !!! JETSON phải dùng khung SPI 46 float (184 byte) — STM đã đổi xong.
+  - SPI framing đầy đủ: magic + sequence + CRC32 (cần đồng bộ Jetson).
+  - BMS -> SAFE_SHUTDOWN (cắt FET có kiểm soát) — tạm bỏ qua.
+  - Dọn: thu hẹp filter CAN ({1-12,100-112,50,51-62,150}); xóa code chết ValidateJoint.
+  - Đo/chỉnh: PROT_JOINT_VEL_ABS_MAX (RPM thực tế), STABLE_DELTA_DEG (rung khi đứng yên).
+  - (Đã xong: bỏ clamp obs; OBS_SEVERE_ENTER=4; OBS_REINIT_CYCLES=250;
+     sign-aware fall detection FALL_TILT_TAN2; falling=init+homing; TX[45]=STATUS;
+     ổn định theo "ít dao động"; nrf_action gate; SPI_TIMEOUT_MS watchdog.)
+================================================================================
