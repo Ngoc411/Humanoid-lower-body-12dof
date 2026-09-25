@@ -1,0 +1,188 @@
+================================================================================
+ GHI CHÚ CHO PHÍA JETSON (SPI MASTER + POLICY)
+ Dự án: Chaos_main_1  —  STM32F407 (main board / SPI slave) <-> Jetson Orin Nano
+ Cập nhật: 2026-06
+================================================================================
+
+Tài liệu này gồm 2 phần:
+  A. Hành vi khi NGÃ (falling) mà Jetson PHẢI làm — đối ứng với STM.
+  B. Các LỚP BẢO VỆ DATA nên/phải có ở Jetson.
+
+Bối cảnh hệ thống (tóm tắt):
+  - Robot 12 khớp. STM hỏi 12 node qua CAN, gom obs, gửi Jetson qua SPI.
+  - Jetson chạy policy, trả action (lệnh vị trí khớp) qua SPI; STM forward xuống node.
+  - Jetson TRIGGER vòng 50Hz LIÊN TỤC (tự đồng hồ). STM là bên quyết định
+    CÓ forward action hay không.
+  - ĐƠN VỊ: trên dây/STM là ĐỘ (deg) và RPM. rad / rad/s CHỈ dùng nội bộ Jetson.
+    => Jetson tự quy đổi deg<->rad, RPM<->rad/s. (IMU angular velocity đã là rad/s.)
+  - Hệ trục: z thẳng đứng, x đi tới (hệ chuẩn). Thẳng đứng = 90° so mặt đất.
+  - KHUNG SPI = 46 float (184 byte) MỖI CHIỀU (đã đổi từ 45). Jetson PHẢI dùng
+    đúng 46 float, nếu không SPI lệch khung (chưa có CRC). Trường mới:
+        TX[45] = STATUS (STM->Jetson):  0.0 = WAIT (chưa sẵn sàng) ; 1.0 = READY.
+    Các trường TX khác: [0-2]angvel(rad/s) [3-5]grav(norm) [6-8]cmd
+        [9-20]joint pos(DEG) [21-32]joint vel(RPM) [33-44]prev action.
+    RX[0]=2.0(CMD_ACTION), RX[1-12]=action(deg), [13-45] padding.
+
+
+================================================================================
+ A. HÀNH VI KHI NGÃ (FALLING)  — Jetson PHẢI làm
+================================================================================
+
+1) PHÁT HIỆN NGÃ (độc lập với STM)
+   - Jetson tự có thuật toán xét góc nghiêng (từ IMU / projected gravity).
+   - Quy ước giống STM: thẳng đứng = 90° so mặt đất; coi là NGÃ khi góc so mặt
+     đất < ngưỡng (STM dùng 70°, tức nghiêng khỏi phương thẳng đứng > 20°).
+     Nên dùng cùng ngưỡng để hai bên nhất quán.
+   - Nên có chống nhiễu (phải nghiêng vài chu kỳ liên tiếp mới kết luận ngã),
+     không kết luận từ 1 mẫu lẻ.
+
+2) KHI XÁC ĐỊNH ĐÃ NGÃ
+   - GIỮ obs sống: Jetson VẪN trigger 50Hz, VẪN pull SPI để đọc obs (gồm STATUS).
+     CHỈ TẮT policy + action (không chạy model, không gửi action).
+   - RESET toàn bộ data/state về 0:
+       * buffer observation, lịch sử action (prev actions),
+       * mọi trạng thái nội bộ của policy (hidden state / RNN nếu có),
+       * bộ lọc, tích phân, normalizer running-stats tạm (nếu áp dụng).
+   - Sau đó chỉ ĐỢI tín hiệu READY từ STM (TX[45]).
+   - (STM song song: phát hiện ngã -> broadcast CAN 150 -> các node HOMING lại;
+     STM "quay về dạng init", bật lại poll homing (TIM5), và đặt STATUS=WAIT.
+     STM dừng forward action; obs vẫn gửi đều với STATUS=WAIT.)
+
+3) ĐIỀU KIỆN ĐỂ CHẠY LẠI = NHẬN READY TỪ STM  (KHÓA CHÉO 2 LỚP)
+   - STM chỉ đặt TX[45]=READY khi: các node HOMING XONG (đủ 12 init) VÀ robot
+     đã ĐỨNG THẲNG ổn định.
+   - Jetson chỉ coi READY là hợp lệ KHI CHÍNH NÓ cũng đã phát hiện ngã trước đó
+     (cùng thuật toán nghiêng với STM). Tức:
+        * Nếu Jetson đang ở trạng thái "đã ngã, đang đợi" + thấy STATUS=READY
+          -> mới chuyển sang bước chạy lại.
+        * READY đến mà Jetson KHÔNG nghĩ là đã ngã -> bỏ qua (chống tín hiệu lạ).
+   - Đây là khóa chéo: cả hai phía phải đồng ý "đã ngã" và "đã hồi phục".
+
+4) SAU KHI NHẬN READY -> CHỜ ỔN ĐỊNH 5s RỒI MỚI XUẤT ACTION
+   - Khi đã hợp lệ READY: bắt đầu chạy model + xuất action.
+   - Nên đợi data ổn định liên tục 5s (obs ít dao động, đầy đủ) rồi mới xuất,
+     tránh hành động trên data quá độ ngay sau khi dậy.
+
+5) PHỐI HỢP THỜI GIAN VỚI STM
+   - STM cũng có cổng "ổn định 5s" (armed): chỉ forward action xuống node khi thấy
+     RUN + obs đủ + action Jetson tươi + ÍT DAO ĐỘNG liên tục 5s.
+   - STM đếm "action ổn định" dựa trên việc Jetson CÓ gửi action; Jetson lại đợi 5s
+     của mình trước khi gửi => tổng từ lúc READY đến lúc robot nhận lệnh ~ 10 GIÂY
+     (5s Jetson + 5s STM nối tiếp). RÚT NGẮN được (đổi STABILIZE_MS + mốc Jetson),
+     phải đổi ĐỒNG BỘ.
+
+   Sơ đồ (sau ngã):
+     ngã -> Jetson tắt policy/action, reset, đợi READY ; STM gửi 150 + WAIT, poll homing
+     node homing xong + đứng thẳng -> STM đặt STATUS=READY
+     Jetson thấy READY (và nó cũng đã ngã) -> bắt đầu (đợi 5s ổn định) -> gửi action
+     STM thấy obs+action ổn định 5s -> "armed" -> xả action xuống node -> chạy lại
+
+6) TƯƠNG TỰ KHI INIT (khởi động)
+   - Lúc mới bật: STM gửi obs với STATUS=WAIT tới khi đủ 12 node init + đứng thẳng,
+     rồi mới READY. Jetson đợi READY mới chạy (init coi như không cần "đã ngã trước").
+   - Sau READY cũng warmup 5s như trên trước khi STM xả action.
+
+
+================================================================================
+ B. CÁC LỚP BẢO VỆ DATA Ở JETSON
+================================================================================
+
+Triết lý:
+  - ACTION (lệnh xuống motor): PHẢI chặn/kẹp — vì đi tới phần cứng.
+  - OBS (data vào policy): phải TRUNG THỰC — KHÔNG kẹp (clamp) giá trị thật;
+    chỉ chặn số rác (NaN/Inf). Kẹp obs = nói dối policy.
+  - Khi nghi ngờ -> KHÔNG hành động (fail-safe), thay vì đoán.
+  - "nếu data lỗi thì không gửi gì cả" (đã thống nhất) — đúng tinh thần fail-safe.
+
+-------------------------------------------------------------------------------
+ B.1  NHÓM PHẢI CÓ (must-have)
+-------------------------------------------------------------------------------
+
+[1] KIỂM KHUNG (framing) khi NHẬN obs từ STM
+    - Nếu sau này thêm magic header/footer + length + CRC + sequence vào khung SPI:
+      kiểm đủ các trường này. Sai -> bỏ khung, không xử lý.
+    - Chống SPI desync/byte-slip (lệch byte -> toàn bộ float thành rác mà vẫn "đủ
+      độ dài"). Đây là rủi ro lớn nhất của SPI.
+    (Hiện khung CHƯA có CRC/seq; cần làm ĐỒNG BỘ cả hai phía STM + Jetson.)
+
+[2] LỌC NaN/Inf TRÊN OBS — ĐẶT TRƯỚC normalize
+    - np.isfinite / nan_to_num NGAY sau khi unpack, TRƯỚC khi chuẩn hóa.
+    - Vì (x-mean)/std có thể tự đẻ NaN khi std≈0.
+    - NaN lan truyền âm thầm trong NumPy/PyTorch -> 1 NaN obs = action NaN.
+
+[3] LỌC NaN/Inf + CLAMP TRÊN ACTION — isfinite TRƯỚC clamp
+    - Thứ tự bắt buộc: kiểm isfinite trước, clamp sau.
+      (clamp(NaN) trả về NaN vì so sánh với NaN luôn False -> clamp KHÔNG chặn NaN.)
+    - Clamp action về dải hợp lệ từng khớp trước khi gửi.
+
+[4] ĐÓNG KHUNG GỬI ĐỐI XỨNG (khi đã thêm CRC/seq)
+    - Jetson chèn + STM kiểm: header + sequence + CRC.
+    - CRC32 phải TRÙNG chuẩn với STM. STM dùng CRC32 tương thích zlib
+      (poly 0xEDB88320, init/xorout 0xFFFFFFFF). Python: zlib.crc32(data) & 0xFFFFFFFF.
+      (Kiểm chéo: CRC32("123456789") == 0xCBF43926.)
+
+[5] FAIL-SAFE: data lỗi -> KHÔNG gửi action
+    - Khung obs hỏng / NaN / không hợp lệ -> KHÔNG chạy policy ra lệnh bừa.
+      Hoặc không gửi gì (STM sẽ giữ tư thế), hoặc gửi lệnh giữ an toàn.
+    - "Khi nghi ngờ thì đừng tác động."
+
+[6] SEQUENCE / FRESHNESS + WATCHDOG
+    - sequence để phát hiện khung lặp (stale), mất khung, sai thứ tự.
+    - watchdog: nếu N chu kỳ không có obs hợp lệ -> coi như mất link -> fail-safe.
+    - Data CŨ nguy hiểm hơn KHÔNG data (vì che giấu sự cố).
+
+-------------------------------------------------------------------------------
+ B.2  NHÓM NÊN CÓ (should-have)
+-------------------------------------------------------------------------------
+
+[7]  RANGE / PLAUSIBILITY trên OBS (chỉ để PHÁT HIỆN, KHÔNG kẹp)
+     - Giá trị hữu hạn nhưng phi lý (vd pos 5000°, vel khổng lồ) -> đánh dấu/cảnh
+       báo, có thể dùng làm tín hiệu vào fail-safe. NHƯNG giữ giá trị thật cho obs.
+
+[8]  SLEW-RATE LIMIT trên ACTION
+     - Giới hạn |action[t] - action[t-1]| để chặn spike đơn lẻ; làm mượt lệnh.
+
+[9]  TIÊU THỤ VALIDITY / TRẠNG THÁI từ STM
+     - Nếu STM gửi kèm bitmask khớp thiếu / cờ trạng thái -> policy biết khớp nào
+       không đáng tin để giảm tin cậy / giữ an toàn. (Cần mở rộng khung — làm sau.)
+
+[10] RETRY KHI CRC FAIL (đặc quyền của master)
+     - STM (slave) không yêu cầu truyền lại được; chỉ Jetson (master) làm được.
+       Obs CRC sai -> Jetson chủ động khởi tạo lại transaction.
+
+[11] BỘ ĐẾM / LOG LỖI
+     - Đếm crc_err, framing_err, seq_gap, nan_count, clip_count, stale_count...
+     - Lỗi gián đoạn (vài lần/giờ) chỉ thấy qua thống kê dài hạn.
+
+[12] CẤU HÌNH TRUYỀN DẪN BẢO THỦ + GUARD KHỞI ĐỘNG
+     - Chọn SPI clock thấp/ổn định (đo thực tế, lùi biên an toàn).
+     - CS sạch, mỗi transaction trọn vẹn (STM là slave NSS_HARD_INPUT -> cạnh CS
+       chính là ranh giới khung; CS bẩn -> desync).
+     - Bỏ qua vài khung đầu sau khi mở SPI (buffer chưa ổn định).
+
+-------------------------------------------------------------------------------
+ B.3  THỨ TỰ ÁP DỤNG ĐÚNG (khi nhận obs)
+-------------------------------------------------------------------------------
+     1. framing (magic/length)      -> sai: bỏ khung
+     2. CRC                         -> sai: bỏ khung (+ retry)
+     3. sequence                    -> lặp/sai thứ tự: bỏ
+     4. isfinite obs (NaN/Inf)      -> thay/loại số rác (TRƯỚC normalize)
+     5. (range chỉ để phát hiện, KHÔNG kẹp obs)
+     6. normalize -> policy
+     7. isfinite action -> clamp action -> (slew) -> đóng khung + CRC -> gửi
+     8. mọi bước: cập nhật bộ đếm lỗi
+
+================================================================================
+ GHI CHÚ KẾT
+================================================================================
+  - Mọi thay đổi liên quan tới KHUNG SPI (CRC/sequence/validity/đơn vị) phải làm
+    ĐỒNG BỘ cả STM lẫn Jetson, nếu không sẽ lệch và hỏng giao tiếp.
+  - Hai bên dùng CHUNG quy ước góc nghiêng/ngã và CHUNG mốc thời gian ổn định 5s.
+  - CAN ID tham chiếu (phía STM <-> node):
+        50      SYNC (STM->node)
+        51..62  action từng khớp (STM->node)
+        1..12   feedback (node->STM)
+        100     hỏi init xong chưa (STM->node)
+        101..112 báo init xong (node->STM)
+        150     FALLING — báo ngã (STM->node, node tự vào trạng thái falling)
+================================================================================
