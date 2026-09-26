@@ -86,6 +86,14 @@ STM32F407 (main board)  ──CAN──►  12× STM32G474 joint nodes (motor co
    to each of the 12 individual joint/motor nodes, one per joint, selected by
    `NODE_ID` at flash time.
 
+<div align="center">
+  <img src="https://raw.githubusercontent.com/Ngoc411/Humanoid-lower-body-12dof/main/setup.jpg" width="500">
+  <br>
+  <em>Physical test rig: Chaos suspended from a tether frame while the RL
+  policy runs live on the Jetson (foreground), so early policies can be
+  tested on hardware without risking a fall.</em>
+</div>
+
 ## Getting started
 
 ### Prerequisites
