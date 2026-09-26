@@ -88,10 +88,23 @@ STM32F407 (main board)  ──CAN──►  12× STM32G474 joint nodes (motor co
 
 ## Getting started
 
-### Simulation / RL training
+### Prerequisites
 
-The `source/Vin_Rsl_Rl` package is an Isaac Lab extension and expects an
-Isaac Lab / Isaac Sim installation.
+The `source/Vin_Rsl_Rl` package is an [Isaac Lab](https://isaac-sim.github.io/IsaacLab/)
+extension, which itself runs on top of
+[NVIDIA Isaac Sim](https://developer.nvidia.com/isaac/sim). Install both before
+using this repo:
+
+- **Isaac Sim** — see the
+  [Isaac Sim installation guide](https://docs.isaacsim.omniverse.nvidia.com/latest/installation/index.html).
+  This project was developed against Isaac Sim 4.5 / 5.0 / 5.1.
+- **Isaac Lab** — see the
+  [Isaac Lab installation guide](https://isaac-sim.github.io/IsaacLab/main/source/setup/installation/index.html)
+  ([GitHub](https://github.com/isaac-sim/IsaacLab)). `source/Vin_Rsl_Rl` follows
+  the standard Isaac Lab extension template, so it installs the same way as
+  any other external Isaac Lab task extension.
+
+### Simulation / RL training
 
 ```bash
 # from the repo root, with an Isaac Lab environment set up
@@ -131,9 +144,22 @@ ros2 run ws1_cpp test_model_node <45 space-separated observation floats>
 
 `Chaos_main_1` and `Chaos_test3` are STM32CubeIDE projects (`.ioc` files
 included). Open each in STM32CubeIDE to build and flash:
-- `Chaos_main_1` → STM32F407VET6 main/SPI-slave board.
-- `Chaos_test3` → STM32G474RETx, flashed once per joint node with a unique
-  `NODE_ID` (1–12).
+- **`Chaos_main_1`** → STM32F407VET6, the main/SPI-slave board. Bridges the
+  Jetson (SPI3, DMA, 46-float / 184-byte frames each direction, triggered at
+  50 Hz by the Jetson) and the 12 joint nodes over CAN. It polls all 12 nodes
+  for feedback, forwards actions only when the system is armed and safe, and
+  owns the fall-detection broadcast (CAN ID `150`) that puts every joint node
+  into a homing state.
+- **`Chaos_test3`** → STM32G474RETx, flashed once per joint node with a
+  unique `NODE_ID` (1–12); all of that node's CAN IDs (command, feedback,
+  init-done) are derived from `NODE_ID`. Each node runs its own motor control
+  loop and reports position/velocity feedback back to the main board.
+
+Both boards share a protection library (`lib/Protection` in `Chaos_main_1`)
+covering NaN/Inf checks, clamping, CRC32 framing, sequence checks, a
+watchdog, and slew-rate limiting — see `STM32_SAFETY_SUMMARY.txt` for the
+full breakdown of what's implemented on the STM32 side versus what's still
+planned (e.g. CRC/sequence numbers are not yet enabled on the SPI link).
 
 ## Safety design
 
