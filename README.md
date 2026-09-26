@@ -159,7 +159,7 @@ included). Open each in STM32CubeIDE to build and flash:
   owns the fall-detection broadcast (CAN ID `150`) that puts every joint node
   into a homing state.
 - **`Chaos_test3`** → STM32G474RETx, flashed once per joint node with a
-  unique `NODE_ID` (1–12); all of that node's CAN IDs (command, feedback,
+  unique `NODE_ID` (0-11); all of that node's CAN IDs (command, feedback,
   init-done) are derived from `NODE_ID`. Each node runs its own motor control
   loop and reports position/velocity feedback back to the main board.
 
