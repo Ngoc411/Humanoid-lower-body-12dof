@@ -237,3 +237,11 @@ fail-safe layers, documented in detail in `Chaos_main_1/NODE_FLOW.md`,
   that reference if you don't need the fixed-base bench.
 - Some in-code comments and internal docs are written in Vietnamese; the
   English summaries above and in this README cover the key behavior.
+
+---
+
+## Author
+
+**Ngoc**
+
+Embedded Systems · Motor Control · Robotics
