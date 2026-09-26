@@ -1,5 +1,5 @@
 <div align="center">
   <img src="https://raw.githubusercontent.com/Ngoc411/Humanoid-lower-body-12dof/main/flat_ter.gif" width="600">
   <br>
-  <em>Humanoid lower-body locomotion</em>
+  <em>IsaacSim - Flat terrain</em>
 </div>
