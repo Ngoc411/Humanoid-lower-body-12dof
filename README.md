@@ -47,6 +47,17 @@ and the embedded firmware that runs on the physical robot.
 │   └── STM32_SAFETY_SUMMARY.txt # NaN/CRC/framing/watchdog protections on the STM32 side
 ├── Chaos_test3/                  # STM32G474 firmware flashed to each of the 12 joint nodes
 │                                 # (one CAN node per motor; NODE_ID selects which joint)
+├── Hardware/                      # Mechanical CAD (SolidWorks) for the physical robot
+│   ├── hip_2/hip_3/hip_connector, knee_1/2_left/right, ankle*  # Structural leg parts
+│   ├── gearbox/                   # Custom planetary gearboxes for the BLDC actuators
+│   │   ├── gearbox_5210/          #   (5210-size motor)
+│   │   └── gearbox_3508/, gearbox_3508_2/  # (3508-size motor, two revisions)
+│   ├── BLDC/                      # Motor mount parts for the 5210 / 3508 / 4108 BLDC motors
+│   ├── bearing/                   # Bearing mounts
+│   ├── assem_symplified.SLDASM    # Full simplified leg/body assembly
+│   └── Jetson Nano.step           # Reference model for mounting the onboard computer
+├── test7.usd                      # Isaac Sim USD asset for Chaos, referenced as
+│                                  # `usd_path` in `source/.../assets/robots/chaos.py`
 └── flat_ter.gif / flat_ter.mov   # Walking demo captured from simulation
 ```
 
@@ -125,6 +136,27 @@ python scripts/rsl_rl/train.py --task <task-name>
 python scripts/rsl_rl/play.py --task <task-name> --checkpoint <path-to-checkpoint>
 ```
 
+A trained checkpoint is already included under `logs/rsl_rl/`, so you can skip
+training and watch the policy walk right away:
+
+```bash
+python scripts/rsl_rl/play.py \
+  --task Template-Vin-Rsl-Rl-Flat-Play-v0 \
+  --checkpoint logs/rsl_rl/2026-07-04_21-39-15/model_14000.pt
+```
+
+The exported ONNX/TorchScript versions of that same policy (used on the real
+robot) are already available at
+`logs/rsl_rl/2026-07-04_21-39-15/exported/{policy.onnx,policy.pt}` — no export
+step needed.
+
+> **Robot USD asset:** `chaos.py` currently points `usd_path` at a local
+> development path (`D:/IsaacSim/test7.usd`). The actual asset is checked into
+> this repo at `test7.usd`; update `usd_path` in
+> `source/Vin_Rsl_Rl/Vin_Rsl_Rl/assets/robots/chaos.py` to point at your local
+> copy of that file (or move/symlink it into your Isaac Sim assets folder)
+> before running training or play.
+
 Equivalent `train.py` / `play.py` entry points are also provided for
 `rl_games`, `sb3`, and `skrl` under `scripts/`.
 
@@ -159,7 +191,7 @@ included). Open each in STM32CubeIDE to build and flash:
   owns the fall-detection broadcast (CAN ID `150`) that puts every joint node
   into a homing state.
 - **`Chaos_test3`** → STM32G474RETx, flashed once per joint node with a
-  unique `NODE_ID` (0-11); all of that node's CAN IDs (command, feedback,
+  unique `NODE_ID` (1–12); all of that node's CAN IDs (command, feedback,
   init-done) are derived from `NODE_ID`. Each node runs its own motor control
   loop and reports position/velocity feedback back to the main board.
 
@@ -168,6 +200,16 @@ covering NaN/Inf checks, clamping, CRC32 framing, sequence checks, a
 watchdog, and slew-rate limiting — see `STM32_SAFETY_SUMMARY.txt` for the
 full breakdown of what's implemented on the STM32 side versus what's still
 planned (e.g. CRC/sequence numbers are not yet enabled on the SPI link).
+
+### Hardware (mechanical design)
+
+`Hardware/` contains the SolidWorks source files for the physical robot: the
+structural leg parts (hip, knee, ankle links and connectors), the custom
+planetary gearboxes built for the 5210 / 3508 BLDC actuators, the BLDC motor
+mounts, bearing mounts, a simplified full-assembly file
+(`assem_symplified.SLDASM`), and a reference STEP model for mounting the
+Jetson Nano. Open the `.SLDPRT` / `.SLDASM` files in SolidWorks (or import the
+`.STEP` files into other CAD tools) to inspect or modify the design.
 
 ## Safety design
 
@@ -189,8 +231,9 @@ fail-safe layers, documented in detail in `Chaos_main_1/NODE_FLOW.md`,
 
 ## Notes
 
-- Simulation asset paths (`D:/IsaacSim/...`) in `chaos.py` are local to the
-  development machine used for training and will need to be updated to your
-  own USD asset locations.
+- `chaos.py` still has a hardcoded `D:/IsaacSim/...` path for the fixed-base
+  variant (`fixed_base.usd`, used only for actuator step-response
+  identification); that file isn't included in this repo, so update or remove
+  that reference if you don't need the fixed-base bench.
 - Some in-code comments and internal docs are written in Vietnamese; the
   English summaries above and in this README cover the key behavior.
