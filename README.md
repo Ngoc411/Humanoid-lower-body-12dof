@@ -1,13 +1,6 @@
 <div align="center">
   <img src="https://raw.githubusercontent.com/Ngoc411/Humanoid-lower-body-12dof/main/flat_ter.gif" width="600">
   <br>
-  <em>IsaacSim - Flat terrain</em>
-</div>
-
-
-<div align="center">
-  <img src="https://raw.githubusercontent.com/Ngoc411/Humanoid-lower-body-12dof/main/flat_ter.gif" width="600">
-  <br>
   <em>Chaos — a 12-DoF humanoid lower-body robot, sim-to-real RL locomotion</em>
 </div>
 
